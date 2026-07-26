@@ -1,0 +1,14 @@
+# Bundled parser metadata for the IntentDiff language-info API.
+# Plugin code exposes this data; the host still owns trust and provenance.
+
+[plugin]
+author = IntentDiff
+plugin_version = 0.1.0
+last_updated = 2026-05-19
+
+[language.bash]
+language_name = Bash
+language_short_name = Bash
+monaco_language = shell
+default_filename = code.sh
+language_file_extensions = 
