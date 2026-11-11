@@ -71,6 +71,11 @@ const SEMANTIC_TYPES: &[&str] = &[
     "declaration_command",
     "unset_command",
     "test_command",
+    // `[ $a -eq 1 ]` / `[ -f x ]`: the comparison or file-test operator is a NAMED leaf, so
+    // it must be semantic to survive projection. Unlike anonymous symbol operators (`==`,
+    // `<`), core cannot recover word-shaped tokens like `-eq`/`-ne` from source gaps, and
+    // without this leaf an `-eq` -> `-ne` edit was certified style-only (issue #4).
+    "test_operator",
     "negated_command",
     "command_substitution",
     "process_substitution",
@@ -310,4 +315,91 @@ mod tests {
         let out = process_impl("   \n  ");
         t::assert_valid_json(&out, "process(whitespace)");
     }
+
+    // ---- issue #4: test-command comparison / file-test operators -----------------------
+
+    fn collect<'a>(n: &'a serde_json::Value, ty: &str, out: &mut Vec<&'a serde_json::Value>) {
+        if n["node_type"] == ty {
+            out.push(n);
+        }
+        if let Some(cs) = n["children"].as_array() {
+            for c in cs {
+                collect(c, ty, out);
+            }
+        }
+    }
+
+    fn nodes_of(src: &str, ty: &str) -> Vec<serde_json::Value> {
+        let out = process_impl(src);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        let mut found = Vec::new();
+        collect(&v, ty, &mut found);
+        found.into_iter().cloned().collect()
+    }
+
+    fn test_operator_labels(src: &str) -> Vec<String> {
+        nodes_of(src, "test_operator")
+            .iter()
+            .map(|n| n["label"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn integer_comparison_operator_is_a_source_anchored_leaf() {
+        // Exact pair from dynamic/bash/external-derived-edit.
+        let old = "status=1\n[ $status -eq 1 ]\n";
+        let new = "status=1\n[ $status -ne 1 ]\n";
+        for (src, op) in [(old, "-eq"), (new, "-ne")] {
+            let ops = nodes_of(src, "test_operator");
+            assert_eq!(ops.len(), 1, "{src:?}");
+            let n = &ops[0];
+            assert_eq!(n["label"], op);
+            let p = &n["position"];
+            assert_eq!(
+                (p["start_line"].as_u64(), p["start_col"].as_u64()),
+                (Some(1), Some(10))
+            );
+            assert_eq!((p["end_line"].as_u64(), p["end_col"].as_u64()), (Some(1), Some(13)));
+        }
+        let h = |s: &str| nodes_of(s, "binary_expression")[0]["structural_hash"].clone();
+        assert_ne!(h(old), h(new));
+        let hop = |s: &str| nodes_of(s, "test_operator")[0]["structural_hash"].clone();
+        assert_ne!(hop(old), hop(new));
+    }
+
+    #[test]
+    fn sibling_test_operators_are_retained() {
+        for (src, op) in [
+            ("[ $a -lt 1 ]\n", "-lt"),
+            ("[ $a -gt 1 ]\n", "-gt"),
+            ("[ $a -le 1 ]\n", "-le"),
+            ("[ $a -ge 1 ]\n", "-ge"),
+            ("[[ $a -eq 1 ]]\n", "-eq"),
+            ("[ -f x ]\n", "-f"),
+            ("[ -d x ]\n", "-d"),
+            ("[ -z \"$a\" ]\n", "-z"),
+            ("[ -n \"$a\" ]\n", "-n"),
+            ("[ $a -nt $b ]\n", "-nt"),
+        ] {
+            assert_eq!(test_operator_labels(src), vec![op.to_string()], "{src:?}");
+        }
+    }
+
+    #[test]
+    fn test_operator_identity_and_spacing_are_preserved() {
+        let base = "status=1\n[ $status -eq 1 ]\n";
+        assert_eq!(process_impl(base), process_impl(base), "deterministic");
+        let spaced = "status=1\n[  $status   -eq  1 ]\n";
+        let h = |s: &str| nodes_of(s, "program")[0]["structural_hash"].clone();
+        assert_eq!(h(base), h(spaced), "layout must not change hashes");
+        assert_eq!(test_operator_labels(spaced), vec!["-eq".to_string()]);
+    }
+
+    #[test]
+    fn plain_command_arguments_are_not_test_operators() {
+        // `test`/`echo` arguments stay words: no operator leaf is invented for them.
+        assert!(test_operator_labels("test $a -eq 1\n").is_empty());
+        assert!(test_operator_labels("echo -n hi\n").is_empty());
+    }
 }
+
